@@ -109,12 +109,17 @@ For sync issues in post-processing, use tools like DaVinci Resolve or `ffmpeg` w
 
 Fork, branch, and submit PRs for features/bugfixes. Tests appreciated!
 
+## Credits
+
+- Developed with assistance from **GROK 4 FAST (BETA)** by xAI.
+- Created by **Asher LeRoy**, Founder of DeMoD LLC.
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0 (GPLv3) - see [LICENSE](LICENSE) for details.
 
 ```
-Copyright (C) 2025 [Your Name or Organization]
+Copyright (C) 2025 Asher LeRoy (DeMoD LLC)
 
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
@@ -128,3 +133,4 @@ GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
+```
