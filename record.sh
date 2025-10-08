@@ -23,7 +23,7 @@
 
 # Dependency checks
 REQUIRED_CMDS=("ffmpeg" "v4l2-ctl")
-OPTIONAL_CMDS=("ffplay" "pactl" "arecord" "lsusb" "udevadm" "jq")
+OPTIONAL_CMDS=("ffplay" "pactl" "arecord" "lsusb" "udevadm" "jq" "bc")
 for cmd in "${REQUIRED_CMDS[@]}"; do
   if ! command -v "$cmd" &> /dev/null; then
     echo "Error: Required command '$cmd' not found. Install it via your package manager (e.g., apt install $cmd)."
@@ -123,7 +123,7 @@ get_max_res_fps() {
   in_format && /Size: Discrete/ { current_size=$3; split($3, dims, "x"); current_area=dims[1]*dims[2]; current_max_fps=0 }
   in_format && /Interval: Discrete/ { match($4, /\(([0-9.]+)/, arr); fps=arr[1]+0; if (fps > current_max_fps) current_max_fps=fps }
   in_format && current_size != "" && current_max_fps > 0 {
-    if (current_area > max_area) {
+    if (current_area > max_area || (current_area == max_area && current_max_fps > max_fps)) {
       max_area = current_area;
       max_size = current_size;
       max_fps = current_max_fps;
@@ -190,7 +190,7 @@ if command -v pactl &> /dev/null; then
       [ -z "$sel" ] && sel=0
       AUDIO_DEVICE=$(echo "${AUDIO_OPTIONS[$sel]}" | awk '{print $1}')
     else
-      AUDIO_DEVICE="${AUDIO_OPTIONS[0]}"
+      AUDIO_DEVICE=$(echo "${AUDIO_OPTIONS[0]}" | awk '{print $1}')
     fi
     echo "Selected USB mic: $AUDIO_DEVICE"
   else
@@ -223,11 +223,12 @@ fi
 
 # Test audio device
 echo "Testing audio device $AUDIO_DEVICE..."
-TEST_CMD="ffmpeg -f $AUDIO_FORMAT -i $AUDIO_DEVICE -t 1 -f null - 2>/dev/null"
-if eval "$TEST_CMD"; then
+TEST_CMD="ffmpeg -f $AUDIO_FORMAT -i $AUDIO_DEVICE -t 1 -f null -"
+TEST_OUTPUT=$(eval "$TEST_CMD" 2>&1)
+if [ $? -eq 0 ]; then
   echo "Audio device test successful."
 else
-  echo "Audio device test failed (No such file or directory or similar)."
+  echo "Audio device test failed: $TEST_OUTPUT"
   SKIP_ANS=$(prompt_yn "Skip audio recording?" "y")
   if [ "$SKIP_ANS" = "y" ]; then
     AUDIO_SKIP=true
@@ -344,6 +345,9 @@ if [ "$OVERLAY_ANS" = "y" ]; then
   fi
   if [ "$OVERLAY" = true ]; then
     # If overlay, force encoding (cannot use copy with filters)
+    if [ "$USE_RAW" = true ]; then
+      echo "Warning: Overlay requires encoding; ignoring --raw and using FFV1/MKV."
+    fi
     VIDEO_CODEC="-c:v ffv1"
     VIDEO_EXT="mkv"  # Switch to mkv for encoded
     VIDEO_FORMAT="-f matroska"
@@ -353,7 +357,7 @@ fi
 
 # Build overlay filter if enabled (escaped for safety)
 if [ "$OVERLAY" = true ]; then
-  OVERLAY_FILTER="-vf \"drawtext=fontfile=$FONT_FILE:text='${OVERLAY_TEXT//\'/\\\'}':fontcolor=white:fontsize=24:borderw=2:x=(w-tw)/2:y=h-(2*th)-20,drawtext=fontfile=$FONT_FILE:text='%{localtime\:%Y-%m-%d %H\\:%M\\:%S}':fontcolor=white:fontsize=24:borderw=2:x=(w-tw)/2:y=h-th-10\""
+  OVERLAY_FILTER="drawtext=fontfile=$FONT_FILE:text='${OVERLAY_TEXT//\'/\\\'}':fontcolor=white:fontsize=24:borderw=2:x=(w-tw)/2:y=h-(2*th)-20,drawtext=fontfile=$FONT_FILE:text='%{localtime\:%Y-%m-%d %H\\:%M\\:%S}':fontcolor=white:fontsize=24:borderw=2:x=(w-tw)/2:y=h-th-10"
 else
   OVERLAY_FILTER=""
 fi
@@ -368,22 +372,34 @@ if command -v ffplay &> /dev/null; then
       echo "Note: Preview and recording may fail if using the same device. Close preview windows before starting recording if issues occur."
     fi
     read -p "Preview scale (e.g., 1.0 full, 0.5 half, default 1.0): " scale_input
-    if [[ "$scale_input" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$scale_input > 0" | bc -l) )); then
+    if [[ "$scale_input" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [ -n "$scale_input" ]; then
       PREVIEW_SCALE="$scale_input"
     else
       PREVIEW_SCALE=1.0
       echo "Invalid scale; using default 1.0."
-    fi
-    if [ $(echo "$PREVIEW_SCALE < 1.0" | bc -l) = 1 ]; then
-      PREVIEW_VF="-vf scale=iw*$PREVIEW_SCALE:ih*$PREVIEW_SCALE"
-    else
-      PREVIEW_VF=""
     fi
     echo "Preview set to scale $PREVIEW_SCALE."
   fi
 else
   PREVIEW=false
   echo "ffplay not found; skipping preview option."
+fi
+
+# Build preview filter (combine overlay and scale if both)
+PREVIEW_FILTER=""
+if [ "$OVERLAY" = true ]; then
+  PREVIEW_FILTER="-vf \"$OVERLAY_FILTER"
+fi
+if command -v bc &> /dev/null && [[ "$PREVIEW_SCALE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$PREVIEW_SCALE < 1.0" | bc -l) )); then
+  if [ -n "$PREVIEW_FILTER" ]; then
+    PREVIEW_FILTER="${PREVIEW_FILTER},scale=iw*$PREVIEW_SCALE:ih*$PREVIEW_SCALE\""
+  else
+    PREVIEW_FILTER="-vf \"scale=iw*$PREVIEW_SCALE:ih*$PREVIEW_SCALE\""
+  fi
+elif [ -n "$PREVIEW_FILTER" ]; then
+  PREVIEW_FILTER="${PREVIEW_FILTER}\""
+else
+  PREVIEW_FILTER=""
 fi
 
 # Array to hold PIDs of background processes
@@ -393,13 +409,15 @@ PIDS=()
 stop_all() {
   echo "Stopping recordings and previews..."
   for PID in "${PIDS[@]}"; do
-    kill -INT "$PID" 2>/dev/null  # Send SIGINT to cleanly stop FFmpeg and ffplay
+    if kill -0 "$PID" 2>/dev/null; then
+      kill -INT "$PID" 2>/dev/null  # Send SIGINT to cleanly stop FFmpeg and ffplay
+    fi
   done
   wait "${PIDS[@]}" 2>/dev/null  # Wait for processes to exit
 }
 
 # Trap for clean exit
-trap stop_all EXIT
+trap stop_all EXIT INT TERM
 
 # Start previews if enabled
 if [ "$PREVIEW" = true ]; then
@@ -407,11 +425,16 @@ if [ "$PREVIEW" = true ]; then
     DEV="${VIDEO_DEVICES[$i]}"
     VIDEO_SIZE="${VIDEO_SIZES[$i]}"
     FRAMERATE="${FRAMERATES[$i]}"
-    PREVIEW_CMD="ffplay -f v4l2 -framerate $FRAMERATE -video_size $VIDEO_SIZE -input_format $INPUT_FORMAT -i $DEV $OVERLAY_FILTER $PREVIEW_VF"
+    PREVIEW_CMD="ffplay -f v4l2 -framerate $FRAMERATE -video_size $VIDEO_SIZE -input_format $INPUT_FORMAT -i $DEV $PREVIEW_FILTER"
     echo "Starting preview for $DEV: $PREVIEW_CMD"
-    $PREVIEW_CMD &
-    PIDS+=($!)
+    eval "$PREVIEW_CMD" &
+    PID=$!
+    if wait $PID 2>/dev/null; then :; else
+      echo "Warning: Preview for $DEV failed to start."
+    fi
+    PIDS+=($PID)
   done
+  read -p "Press Enter to start recordings (close previews if conflicts expected): "
 fi
 
 # Start video recordings in background (outputs to SCRIPT_DIR)
@@ -420,27 +443,42 @@ for i in "${!VIDEO_DEVICES[@]}"; do
   VIDEO_SIZE="${VIDEO_SIZES[$i]}"
   FRAMERATE="${FRAMERATES[$i]}"
   VID_OUTPUT="$SCRIPT_DIR/${BASE_NAME}_cam${i}.$VIDEO_EXT"
+  DURATION_OPT=""
   if [ -n "$DURATION" ]; then
-    FULL_CMD="timeout $DURATION ffmpeg -f v4l2 -framerate $FRAMERATE -video_size $VIDEO_SIZE -input_format $INPUT_FORMAT -thread_queue_size $THREAD_QUEUE_SIZE -i $DEV $OVERLAY_FILTER $VIDEO_CODEC $VIDEO_FORMAT -y $VID_OUTPUT"
-  else
-    FULL_CMD="ffmpeg -f v4l2 -framerate $FRAMERATE -video_size $VIDEO_SIZE -input_format $INPUT_FORMAT -thread_queue_size $THREAD_QUEUE_SIZE -i $DEV $OVERLAY_FILTER $VIDEO_CODEC $VIDEO_FORMAT -y $VID_OUTPUT"
+    DURATION_OPT="-t $DURATION"
   fi
+  if [ -n "$OVERLAY_FILTER" ]; then
+    VF_OPT="-vf \"$OVERLAY_FILTER\""
+  else
+    VF_OPT=""
+  fi
+  FULL_CMD="ffmpeg -f v4l2 -framerate $FRAMERATE -video_size $VIDEO_SIZE -input_format $INPUT_FORMAT -thread_queue_size $THREAD_QUEUE_SIZE -i $DEV $DURATION_OPT $VF_OPT $VIDEO_CODEC $VIDEO_FORMAT -y $VID_OUTPUT"
   echo "Starting video recording for $DEV to $VID_OUTPUT: $FULL_CMD"
-  eval $FULL_CMD &
-  PIDS+=($!)
+  eval "$FULL_CMD" &
+  PID=$!
+  if ps -p $PID > /dev/null; then
+    PIDS+=($PID)
+  else
+    echo "Error: Failed to start recording for $DEV."
+  fi
 done
 
 # Start audio recording in background if not skipped (outputs to SCRIPT_DIR)
 if [ "$AUDIO_SKIP" = false ]; then
   AUDIO_OUTPUT="$SCRIPT_DIR/${BASE_NAME}_audio.${AUDIO_EXT}"
+  DURATION_OPT=""
   if [ -n "$DURATION" ]; then
-    FULL_CMD="timeout $DURATION ffmpeg -f $AUDIO_FORMAT -i $AUDIO_DEVICE $AUDIO_CODEC $AUDIO_FORMAT_OPT -y $AUDIO_OUTPUT"
-  else
-    FULL_CMD="ffmpeg -f $AUDIO_FORMAT -i $AUDIO_DEVICE $AUDIO_CODEC $AUDIO_FORMAT_OPT -y $AUDIO_OUTPUT"
+    DURATION_OPT="-t $DURATION"
   fi
+  FULL_CMD="ffmpeg -f $AUDIO_FORMAT -i $AUDIO_DEVICE $DURATION_OPT $AUDIO_CODEC $AUDIO_FORMAT_OPT -y $AUDIO_OUTPUT"
   echo "Starting audio recording to $AUDIO_OUTPUT: $FULL_CMD"
-  eval $FULL_CMD &
-  PIDS+=($!)
+  eval "$FULL_CMD" &
+  PID=$!
+  if ps -p $PID > /dev/null; then
+    PIDS+=($PID)
+  else
+    echo "Error: Failed to start audio recording."
+  fi
 else
   echo "Audio skipped."
 fi
@@ -448,7 +486,7 @@ fi
 # Wait for duration or user input to stop
 if [ -n "$DURATION" ]; then
   echo "Recordings will auto-stop after $DURATION seconds."
-  sleep $DURATION
+  wait "${PIDS[@]}"  # Wait for all processes to finish
 else
   echo "All recordings started. Outputs will be saved to: $SCRIPT_DIR"
   echo "Press 'q' and Enter to end the recording session."
